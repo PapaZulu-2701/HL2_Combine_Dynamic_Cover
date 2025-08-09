@@ -4241,31 +4241,31 @@ void CNPC_Combine::OnEndMoveAndShoot()
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeapon)
+WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency( CBaseCombatWeapon *pWeapon )
 {
 #ifdef MAPBASE
-	if (pWeapon->ClassMatches(gm_isz_class_AR2))
+	if( pWeapon->ClassMatches( gm_isz_class_AR2 ) )
 #else
-	if (FClassnameIs(pWeapon, "weapon_ar2"))
+	if( FClassnameIs( pWeapon, "weapon_ar2" ) )
 #endif
 	{
-		if (hl2_episodic.GetBool())
+		if( hl2_episodic.GetBool() )
 		{
 			return WEAPON_PROFICIENCY_VERY_GOOD;
 		}
 		else
 		{
-			return WEAPON_PROFICIENCY_VERY_GOOD;
+			return WEAPON_PROFICIENCY_GOOD;
 		}
 	}
 #ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_Shotgun))
+	else if( pWeapon->ClassMatches( gm_isz_class_Shotgun ) )
 #else
-	else if (FClassnameIs(pWeapon, "weapon_shotgun"))
+	else if( FClassnameIs( pWeapon, "weapon_shotgun" )	)
 #endif
 	{
 #ifndef MAPBASE // Moved so soldiers don't change skin unnaturally and uncontrollably
-		if (m_nSkin != COMBINE_SKIN_SHOTGUNNER)
+		if( m_nSkin != COMBINE_SKIN_SHOTGUNNER )
 		{
 			m_nSkin = COMBINE_SKIN_SHOTGUNNER;
 		}
@@ -4274,23 +4274,24 @@ WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeap
 		return WEAPON_PROFICIENCY_PERFECT;
 	}
 #ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_SMG1))
+	else if( pWeapon->ClassMatches( gm_isz_class_SMG1 ) )
 #else
-	else if (FClassnameIs(pWeapon, "weapon_smg1"))
+	else if( FClassnameIs( pWeapon, "weapon_smg1" ) )
 #endif
 	{
-		return WEAPON_PROFICIENCY_VERY_GOOD;
+		return WEAPON_PROFICIENCY_GOOD;
 	}
 #ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_Pistol))
+	else if ( pWeapon->ClassMatches( gm_isz_class_Pistol ) )
 	{
 		// Mods which need a lower soldier pistol accuracy can either change this value or use proficiency override in Hammer.
 		return WEAPON_PROFICIENCY_VERY_GOOD;
 	}
 #endif
 
-	return BaseClass::CalcWeaponProficiency(pWeapon);
+	return BaseClass::CalcWeaponProficiency( pWeapon );
 }
+
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
