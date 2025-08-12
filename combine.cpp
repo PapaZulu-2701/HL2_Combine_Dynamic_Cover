@@ -4704,7 +4704,7 @@ WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeap
 		}
 		else
 		{
-			return WEAPON_PROFICIENCY_VERY_GOOD;
+			return WEAPON_PROFICIENCY_GOOD;
 		}
 	}
 #ifdef MAPBASE
@@ -4728,7 +4728,7 @@ WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeap
 	else if (FClassnameIs(pWeapon, "weapon_smg1"))
 #endif
 	{
-		return WEAPON_PROFICIENCY_VERY_GOOD;
+		return WEAPON_PROFICIENCY_GOOD;
 	}
 #ifdef MAPBASE
 	else if (pWeapon->ClassMatches(gm_isz_class_Pistol))
