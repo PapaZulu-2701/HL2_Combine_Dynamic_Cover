@@ -1,7 +1,6 @@
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
-// Press ctrl + f and type [MODIFICATION-Dynamic Cover] to find the specific logics of Dynamic Cover Mod
 //
 //=============================================================================//
 
@@ -30,6 +29,8 @@
 #include "weapon_physcannon.h"
 #include "SoundEmitterSystem/isoundemittersystembase.h"
 #include "npc_headcrab.h"
+#include "physics.h"                    // [MODIFICATION] Required for core VPhysics definitions..
+#include "vphysics_interface.h"        // [MODIFICATION] Required for IPhysicsObject and functions like VPhysicsGetObject().
 #ifdef MAPBASE
 #include "mapbase/GlobalStrings.h"
 #include "globalstate.h"
@@ -263,10 +264,10 @@ CNPC_Combine::CNPC_Combine()
 	m_bForceFastTurn = false;			// [MODIFICATION] "Turbo turn" flag. Starts false. Without it, the AI would have maximum turn speed at all times.
 	m_flNextGrenadePanicTime = 0;		// [MODIFICATION] Panic grenade cooldown timer. Starts at 0.
 	m_bIsDoingPanicDrop = false;		// [MODIFICATION] Panic drop state flag. Must start false.
-	
-	m_hLowCoverProp = NULL;				// [MODIFICATION-Dynamic Cover] Handle to selected low cover prop for dynamic cover system.
-	m_hHighCoverProp = NULL;			// [MODIFICATION-Dynamic Cover] Handle to selected high cover prop for dynamic cover system.
-	m_flNextPropSearchTime = 0;		// [MODIFICATION-Dynamic Cover] Timer to control how often dynamic cover props are searched. Allows immediate search on spawn.	
+	m_hLowCoverProp = NULL;				// [MODIFICATION] Handle to selected low cover prop for dynamic cover system. // [MODIFICATION-Dynamic Cover]
+	m_hHighCoverProp = NULL;			// [MODIFICATION] Handle to selected high cover prop for dynamic cover system. // [MODIFICATION-Dynamic Cover]
+	m_hLastArrivedProp = NULL;			// Initialize last arrived prop as NULL // [MODIFICATION-Dynamic Cover]
+	m_flNextPropSearchTime = 0;			// [MODIFICATION] Timer to control how often dynamic cover props are searched. Allows immediate search on spawn. // [MODIFICATION-Dynamic Cover]	
 }
 
 
@@ -289,7 +290,7 @@ bool CNPC_Combine::CreateComponents()
 
 
 // ============================================
-// [MODIFICATION-Dynamic Cover]  HELPER FUNCTION - Count NPCs using a prop
+// HELPER FUNCTION - Count NPCs using a prop [MODIFICATION-Dynamic Cover]
 // ============================================
 int CNPC_Combine::CountNPCsUsingProp(CBaseEntity* pProp)
 {
@@ -300,11 +301,17 @@ int CNPC_Combine::CountNPCsUsingProp(CBaseEntity* pProp)
 	CBaseEntity* pEntity = NULL;
 
 	// Search all entities within a radius around the prop
-	for (CEntitySphereQuery sphere(pProp->GetAbsOrigin(), 600.0f); (pEntity = sphere.GetCurrentEntity()) != NULL; sphere.NextEntity())
+	for (CEntitySphereQuery sphere(pProp->GetAbsOrigin(), 300.0f); (pEntity = sphere.GetCurrentEntity()) != NULL; sphere.NextEntity())
 	{
 		// Try casting to Combine NPC
 		CNPC_Combine* pCombine = dynamic_cast<CNPC_Combine*>(pEntity);
 		if (!pCombine || pCombine == this) // Skip self
+			continue;
+
+		// CRASH PREVENTION: Skip dead/dying NPCs to avoid race conditions during cover search
+		// This prevents crashes when NPCs die exactly during timer-triggered cover calculations
+		// Double validation ensures maximum safety against timing-critical scenarios
+		if (pCombine->GetHealth() <= 0 || !pCombine->IsAlive())
 			continue;
 
 		// Check if using the same prop
@@ -318,8 +325,9 @@ int CNPC_Combine::CountNPCsUsingProp(CBaseEntity* pProp)
 }
 
 
+
 //-----------------------------------------------------------------------------
-// [MODIFICATION-Dynamic Cover] -  Dynamic Cover
+// [MODIFICATION] -  Dynamic Cover
 //-----------------------------------------------------------------------------
 
 bool CNPC_Combine::DynamicPropCover()
@@ -347,6 +355,9 @@ bool CNPC_Combine::DynamicPropCover()
 	};
 
 	static const char* highCover[] = {
+	"models/combine_apc.mdl",
+	"models/combine_apc_destroyed_gib01.mdl",
+	"models/combine_apc_wheelcollision.mdl",
 	"models/combine_strider.mdl",
 	"models/gibs/helicopter_brokenpiece_04_cockpit.mdl",
 	"models/gibs/helicopter_brokenpiece_06_body.mdl",
@@ -368,6 +379,7 @@ bool CNPC_Combine::DynamicPropCover()
 	"models/props_vehicles/truck003a.mdl",
 	"models/props_vehicles/van001a.mdl",
 	"models/props_vehicles/wagon001a.mdl",
+	"models/props_wasteland/cargo_container01.mdl"
 	};
 
 	// Reset handles
@@ -378,9 +390,9 @@ bool CNPC_Combine::DynamicPropCover()
 	const int MAX_NPCS_PER_PROP = 2;
 
 	// Search for all props in radius
-	for (CBaseEntity* pEntity = gEntList.FindEntityInSphere(NULL, GetAbsOrigin(), 512.0f);
+	for (CBaseEntity* pEntity = gEntList.FindEntityInSphere(NULL, GetAbsOrigin(), 270.0f);
 		pEntity;
-		pEntity = gEntList.FindEntityInSphere(pEntity, GetAbsOrigin(), 512.0f))
+		pEntity = gEntList.FindEntityInSphere(pEntity, GetAbsOrigin(), 270.0f))
 	{
 		if (!FClassnameIs(pEntity, "prop_physics") && !FClassnameIs(pEntity, "prop_ragdoll"))
 			continue;
@@ -433,7 +445,24 @@ bool CNPC_Combine::DynamicPropCover()
 	// Select random props from available arrays
 	if (availableLowCoverProps.Count() > 0)
 	{
-		m_hLowCoverProp = availableLowCoverProps[RandomInt(0, availableLowCoverProps.Count() - 1)];
+		CBaseEntity* newLowCoverProp = NULL;
+
+		// If there's only one prop available or no previous prop, select normally
+		if (availableLowCoverProps.Count() == 1 || !m_hLowCoverProp)
+		{
+			newLowCoverProp = availableLowCoverProps[RandomInt(0, availableLowCoverProps.Count() - 1)];
+		}
+		else
+		{
+			// Multiple props available and we have a previous prop - avoid repeating
+			int attempts = 0;
+			do {
+				newLowCoverProp = availableLowCoverProps[RandomInt(0, availableLowCoverProps.Count() - 1)];
+				attempts++;
+			} while (newLowCoverProp == m_hLowCoverProp && attempts < 10);
+		}
+
+		m_hLowCoverProp = newLowCoverProp;
 		Msg("[DEBUG] Selected LOW COVER with available slot\n");
 	}
 	else
@@ -443,7 +472,24 @@ bool CNPC_Combine::DynamicPropCover()
 
 	if (availableHighCoverProps.Count() > 0)
 	{
-		m_hHighCoverProp = availableHighCoverProps[RandomInt(0, availableHighCoverProps.Count() - 1)];
+		CBaseEntity* newHighCoverProp = NULL;
+
+		// If there's only one prop available or no previous prop, select normally
+		if (availableHighCoverProps.Count() == 1 || !m_hHighCoverProp)
+		{
+			newHighCoverProp = availableHighCoverProps[RandomInt(0, availableHighCoverProps.Count() - 1)];
+		}
+		else
+		{
+			// Multiple props available and we have a previous prop - avoid repeating
+			int attempts = 0;
+			do {
+				newHighCoverProp = availableHighCoverProps[RandomInt(0, availableHighCoverProps.Count() - 1)];
+				attempts++;
+			} while (newHighCoverProp == m_hHighCoverProp && attempts < 10);
+		}
+
+		m_hHighCoverProp = newHighCoverProp;
 		Msg("[DEBUG] Selected HIGH COVER with available slot\n");
 	}
 	else
@@ -726,29 +772,28 @@ void CNPC_Combine::GatherConditions()
 	BaseClass::GatherConditions();
 	ClearCondition(COND_COMBINE_ATTACK_SLOT_AVAILABLE);
 	if (GetState() == NPC_STATE_COMBAT && GetEnemy())
-	{ // [MODIFICATION-Dynamic Cover] - Start
-		// Only search for new props when timer allows
+	{
+		// Check timer before seeking new cover
 		if (gpGlobals->curtime >= m_flNextPropSearchTime)
 		{
-			// Clear conditions and search for new props
 			ClearCondition(COND_COMBINE_HAS_LOW_COVER);
 			ClearCondition(COND_COMBINE_HAS_HIGH_COVER);
+			m_hLastArrivedProp = NULL; // Clear flag to allow new cover selection
 			DynamicPropCover();
-
-			// Set next search time (8-12 seconds)
-			float randomInterval = RandomFloat(8.0f, 12.0f);
-			m_flNextPropSearchTime = gpGlobals->curtime + randomInterval;
-			Msg("[DEBUG] GatherConditions: NEW SEARCH executed - next in %.1fs\n", randomInterval);
+			Msg("[DEBUG] GatherConditions: Timer expired - searching new cover\n");
 		}
 		else
 		{
-			// Use already selected props
-			Msg("[DEBUG] GatherConditions: Keeping current props - next search in %.1fs\n",
+			Msg("[DEBUG] GatherConditions: Timer active - keeping current cover (%.1fs remaining)\n",
 				m_flNextPropSearchTime - gpGlobals->curtime);
+			// Don't search for new props, but continue validating current ones below
 		}
 
 		// Check if enemy is too close to current props
-		Vector enemyPos = GetEnemy()->GetAbsOrigin();
+		CBaseEntity* pEnemy = GetEnemy();
+		if (!pEnemy) return; // CRASH PREVENTION: Validate enemy exists
+
+		Vector enemyPos = pEnemy->GetAbsOrigin();
 		const float MIN_COVER_DISTANCE = 150.0f;
 		bool enemyTooClose = (m_hLowCoverProp && enemyPos.DistTo(m_hLowCoverProp->GetAbsOrigin()) < MIN_COVER_DISTANCE) ||
 			(m_hHighCoverProp && enemyPos.DistTo(m_hHighCoverProp->WorldSpaceCenter()) < MIN_COVER_DISTANCE);
@@ -767,7 +812,20 @@ void CNPC_Combine::GatherConditions()
 				enemyToProp.z = 0;
 				Vector testPos = m_hLowCoverProp->GetAbsOrigin() + (enemyToProp * 80.0f);
 
-				if (GetNavigator()->CanFitAtPosition(testPos, MASK_NPCSOLID))
+				// Check if enemy NPCs are near this cover
+				bool enemyNPCNearCover = false;
+				CBaseEntity* pEntity = NULL;
+				for (CEntitySphereQuery sphere(m_hLowCoverProp->GetAbsOrigin(), 100.0f); (pEntity = sphere.GetCurrentEntity()) != NULL; sphere.NextEntity())
+				{
+					CAI_BaseNPC* pNPC = dynamic_cast<CAI_BaseNPC*>(pEntity);
+					if (pNPC && pNPC != this && IRelationType(pNPC) == D_HT) // Check for enemy relationship
+					{
+						enemyNPCNearCover = true;
+						break;
+					}
+				}
+
+				if (!enemyNPCNearCover && GetNavigator()->CanFitAtPosition(testPos, MASK_NPCSOLID))
 				{
 					SetCondition(COND_COMBINE_HAS_LOW_COVER);
 					Msg("[DEBUG] GatherConditions: LOW COVER valid and navigable\n");
@@ -775,7 +833,8 @@ void CNPC_Combine::GatherConditions()
 				else
 				{
 					m_hLowCoverProp = NULL;
-					Msg("[DEBUG] GatherConditions: LOW COVER discarded - not navigable\n");
+					Msg("[DEBUG] GatherConditions: LOW COVER discarded - %s\n",
+						enemyNPCNearCover ? "enemy nearby" : "not navigable");
 				}
 			}
 
@@ -787,7 +846,20 @@ void CNPC_Combine::GatherConditions()
 				enemyToProp.z = 0;
 				Vector testPos = m_hHighCoverProp->WorldSpaceCenter() + (enemyToProp * 80.0f);
 
-				if (GetNavigator()->CanFitAtPosition(testPos, MASK_NPCSOLID))
+				// Check if enemy NPCs are near this cover
+				bool enemyNPCNearCover = false;
+				CBaseEntity* pEntity = NULL;
+				for (CEntitySphereQuery sphere(m_hHighCoverProp->WorldSpaceCenter(), 100.0f); (pEntity = sphere.GetCurrentEntity()) != NULL; sphere.NextEntity())
+				{
+					CAI_BaseNPC* pNPC = dynamic_cast<CAI_BaseNPC*>(pEntity);
+					if (pNPC && pNPC != this && IRelationType(pNPC) == D_HT) // Check for enemy relationship
+					{
+						enemyNPCNearCover = true;
+						break;
+					}
+				}
+
+				if (!enemyNPCNearCover && GetNavigator()->CanFitAtPosition(testPos, MASK_NPCSOLID))
 				{
 					SetCondition(COND_COMBINE_HAS_HIGH_COVER);
 					Msg("[DEBUG] GatherConditions: HIGH COVER valid and navigable\n");
@@ -795,11 +867,49 @@ void CNPC_Combine::GatherConditions()
 				else
 				{
 					m_hHighCoverProp = NULL;
-					Msg("[DEBUG] GatherConditions: HIGH COVER discarded - not navigable\n");
+					Msg("[DEBUG] GatherConditions: HIGH COVER discarded - %s\n",
+						enemyNPCNearCover ? "enemy nearby" : "not navigable");
 				}
 			}
-		} // [MODIFICATION-Dynamic Cover] - End
+		}
 	}
+	// [MODIFICATION-Dynamic Cover] - End
+
+		if (HasCondition(COND_HEAR_DANGER))
+		{
+			// Cooldown check
+			if (gpGlobals->curtime < m_flNextGrenadeCatchTime)
+			{
+				ClearCondition(COND_CAN_KICK_GRENADE);
+				ClearCondition(COND_CAN_RETURN_GRENADE);
+				return;
+			}
+
+			// State check
+			if (GetActivity() == ACT_RELOAD)
+			{
+				ClearCondition(COND_CAN_KICK_GRENADE);
+				ClearCondition(COND_CAN_RETURN_GRENADE);
+				return;
+			}
+
+			CSound* pSound = GetBestSound();
+			if (pSound && pSound->m_hOwner)
+			{
+				if (strcmp(pSound->m_hOwner->GetClassname(), "npc_grenade_frag") == 0)
+				{
+					const float flAbilityRange = 50.0f;
+					float flDist = GetAbsOrigin().DistTo(pSound->m_hOwner->GetAbsOrigin());
+
+					if (flDist <= flAbilityRange)
+					{
+						SetCondition(COND_CAN_KICK_GRENADE);
+						SetCondition(COND_CAN_RETURN_GRENADE);
+					}
+				}
+			}
+		}
+	
 
 #ifdef MAPBASE
 	if (IsCurSchedule(SCHED_COMBINE_WAIT_IN_COVER, false) && !m_StandoffBehavior.IsActive())
@@ -807,7 +917,7 @@ void CNPC_Combine::GatherConditions()
 	if (IsCurSchedule(SCHED_COMBINE_WAIT_IN_COVER, false))
 #endif
 	{
-		if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 		{
 			SetCondition(COND_COMBINE_ATTACK_SLOT_AVAILABLE);
 		}
@@ -917,6 +1027,17 @@ void CNPC_Combine::DelaySquadAltFireAttack(float flDelay)
 //-----------------------------------------------------------------------------
 float CNPC_Combine::MaxYawSpeed(void)
 {
+	// [MODIFICATION] This is a high-priority override for our "turbo turn" mechanic.
+	// It checks our custom flag before running the default logic.
+	// Without it: The Combine would be locked to its default, slower turning speeds,
+	// making the grenade-facing action too slow to be effective before the grenade explodes.
+	if (m_bForceFastTurn)
+	{
+		// If the flag is set by TASK_COMBINE_FACE_GRENADE, return a very high turning speed.
+		return 300.0f;
+	}
+
+
 	switch (GetActivity())
 	{
 	case ACT_TURN_LEFT:
@@ -1157,6 +1278,155 @@ void CNPC_Combine::StartTask(const Task_t* pTask)
 
 	switch (pTask->iTask)
 	{
+	case TASK_COMBINE_PULL_GRENADE:
+	{
+		// Set the state flag to true, preventing the AI from throwing a duplicate grenade via AnimEvent.
+		m_bIsReturningGrenade = true;
+		DevMsg("StartTask: INICIANDO TASK DE PUXAR (PULL_GRENADE).\n");
+
+		// Find the grenade entity by getting the source of the last danger sound.
+		CSound* pSound = GetBestSound();
+		if (pSound && pSound->m_hOwner && strcmp(pSound->m_hOwner->GetClassname(), "npc_grenade_frag") == 0)
+		{
+			// If found, store a handle to it for the RunTask to use.
+			m_hPulledObject = pSound->m_hOwner;
+			DevMsg("StartTask: Alvo travado: %s\n", m_hPulledObject->GetClassname());
+		}
+		else
+		{
+			// If no valid grenade is found, fail the task and abort the schedule.
+			DevMsg("StartTask: Falha ao iniciar PULL_GRENADE. Alvo inválido ou som expirou.\n");
+			TaskFail(FAIL_NO_ENEMY);
+		}
+		break;
+	}
+
+	// [MODIFICATION] This case executes the "throw back" part of the "Catch and Return" ability.
+	// It detaches the grenade, applies a launch velocity, and resets state variables.
+	// Without it: The caught grenade would remain stuck to the Combine's hand indefinitely.
+	case TASK_COMBINE_LAUNCH_GRENADE:
+	{
+		// First, reset the state flag to allow normal grenade throws again.
+		m_bIsReturningGrenade = false;
+
+		if (m_hPulledObject.Get())
+		{
+			IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
+			if (pPhysObject)
+			{
+				// Detach the grenade from the hand and re-enable its physics simulation.
+				m_hPulledObject->SetParent(NULL);
+				pPhysObject->EnableMotion(true);
+				pPhysObject->Wake();
+
+				// This logic launches the grenade towards the current enemy.
+				CBaseEntity* pEnemy = GetEnemy();
+				if (pEnemy)
+				{
+					Vector vecLaunchDir = pEnemy->WorldSpaceCenter() - m_hPulledObject->WorldSpaceCenter();
+					VectorNormalize(vecLaunchDir);
+
+					Vector vecForward, vecUp;
+					GetVectors(&vecForward, NULL, &vecUp);
+					Vector vecVelocity = (vecLaunchDir * 750.0f) + (vecUp * 175.0f);
+					pPhysObject->SetVelocity(&vecVelocity, NULL);
+				}
+				else // Just a fail safe 
+				{
+					Vector vecForward, vecUp;
+					GetVectors(&vecForward, NULL, &vecUp);
+
+					// The npc throws the grenade to where he is  currently facing
+					Vector vecVelocity = (vecForward * 750.0f) + (vecUp * 175.0f);
+
+					pPhysObject->SetVelocity(&vecVelocity, NULL);
+				}
+
+				// Activate the ability's cooldown.
+				m_flNextGrenadeCatchTime = gpGlobals->curtime + 2.5f;
+			}
+			// Clean up the handle.
+			m_hPulledObject = NULL;
+		}
+
+		TaskComplete();
+		break;
+	}
+
+	// [MODIFICATION] This case initiates the "turbo turn" behavior.
+	// Its only job is to set a flag that is checked by the MaxYawSpeed() override.
+	// Without it: The facing task would be very slow, likely causing the grenade to explode before the ability completes.}
+	case TASK_COMBINE_FACE_GRENADE:
+	{
+		// Ao iniciar a task, LIGA o modo turbo.
+		m_bForceFastTurn = true;
+		DevMsg("StartTask: Iniciando task para VIRAR para a granada (TURBO LIGADO).\n");
+		break;
+	}
+
+	// [MODIFICATION] This task "memorizes" the grenade for the kick schedule.
+	// It finds the grenade and stores it in our private handle.
+	// Without it: The kick logic in HandleAnimEvent would not know which object to apply force to.
+	case TASK_COMBINE_MEMORIZE_GRENADE:
+	{
+		CSound* pSound = GetBestSound();
+		if (pSound && pSound->m_hOwner)
+		{
+			m_hPulledObject = pSound->m_hOwner;
+			TaskComplete();
+		}
+		else
+		{
+			TaskFail(FAIL_NO_TARGET);
+		}
+		break;
+	}
+
+	// [MODIFICATION] This task applies the kick physics to the memorized grenade.
+	// It is used in the "Kick Grenade" schedule as an alternative to using an AnimEvent.
+	// Without it: The kick animation would play, but no force would be applied to the grenade.
+	case TASK_COMBINE_KICK_LAUNCH:
+	{
+		// When this task runs, the ability is over, so reset the state flag.
+		m_bIsReturningGrenade = false;
+
+		// Check if the NPC is actually holding an object to kick.
+		if (m_hPulledObject.Get())
+		{
+			// Get the physics object associated with the held entity.
+			IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
+
+			// Ensure we have a valid physics object to manipulate.
+			if (pPhysObject)
+			{
+				// Declare vectors to store the NPC's forward and upward orientation.
+				Vector vecForward, vecUp;
+				// Get the NPC's current forward and up direction vectors.
+				GetVectors(&vecForward, NULL, &vecUp);
+
+				// Calculate the kick velocity: a strong forward force (800 units) with a slight upward lift (200 units).
+				Vector vecKickVelocity = (vecForward * 800.0f) + (vecUp * 200.0f);
+				// Apply the calculated velocity to the physics object, launching it.
+				pPhysObject->SetVelocity(&vecKickVelocity, NULL);
+
+				// Play the weapon bash/kick sound effect.
+				EmitSound("NPC_Combine.WeaponBash");
+
+				// Set a cooldown of 2.5 seconds before this ability can be used again.
+				m_flNextGrenadeCatchTime = gpGlobals->curtime + 2.5f;
+				// Clear the handle to the pulled object, as the NPC is no longer holding it.
+				m_hPulledObject = NULL;
+			}
+		}
+		// Signal to the AI scheduler that this task has been successfully completed.
+		TaskComplete();
+		// Exit the switch statement.
+		break;
+	}
+
+
+
+
 	case TASK_COMBINE_MOVE_TO_HIGH_COVER:  // [MODIFICATION-Dynamic Cover]
 	{
 		if (!m_hHighCoverProp || !GetEnemy())
@@ -1181,35 +1451,59 @@ void CNPC_Combine::StartTask(const Task_t* pTask)
 		Vector enemyToProp = propCenter - enemyPos;
 		VectorNormalize(enemyToProp);
 		enemyToProp.z = 0;
+
 		Vector vMins, vMaxs;
 		m_hHighCoverProp->GetCollideable()->WorldSpaceSurroundingBounds(&vMins, &vMaxs);
 		const float BASE_OFFSET = 80.0f;
+
 		Vector positions[3] = {
-		 Vector(vMins.x, propCenter.y, vMins.z) + (enemyToProp * BASE_OFFSET),  // ESQUERDA
-		 propCenter + (enemyToProp * BASE_OFFSET),                              // CENTRO  
-		 Vector(vMaxs.x, propCenter.y, vMins.z) + (enemyToProp * BASE_OFFSET)   // DIREITA
+			Vector(vMins.x, propCenter.y, vMins.z) + (enemyToProp * BASE_OFFSET),  // LEFT
+			propCenter + (enemyToProp * BASE_OFFSET),                              // CENTER  
+			Vector(vMaxs.x, propCenter.y, vMins.z) + (enemyToProp * BASE_OFFSET)   // RIGHT
 		};
+
 		// Choose zone closest to enemy
 		int chosenIndex = 1; // Default: center
 		float distances[3] = {
-		 enemyPos.DistTo(positions[0]),
-		 enemyPos.DistTo(positions[1]),
-		 enemyPos.DistTo(positions[2])
+			enemyPos.DistTo(positions[0]),
+			enemyPos.DistTo(positions[1]),
+			enemyPos.DistTo(positions[2])
 		};
+
 		if (distances[0] < distances[1] && distances[0] < distances[2]) chosenIndex = 0;
 		else if (distances[2] < distances[1] && distances[2] < distances[0]) chosenIndex = 2;
+
 		Vector targetPosition = positions[chosenIndex];
 		float distToTarget = GetAbsOrigin().DistTo(targetPosition);
+
 		Msg("[DEBUG] HIGH_COVER: Zone %s, dist=%.1f\n",
 			(chosenIndex == 0) ? "LEFT" : (chosenIndex == 2) ? "RIGHT" : "CENTER", distToTarget);
-		// Check if already arrived
+
+		// Check if already arrived at target position
 		if (distToTarget <= 50.0f)
 		{
 			ClearCondition(COND_COMBINE_HAS_HIGH_COVER);
+
+			// Only reset timer if this is a new prop (different from last arrived)
+			if (m_hLastArrivedProp != m_hHighCoverProp)
+			{
+				float randomInterval = RandomFloat(8.0f, 12.0f);
+				m_flNextPropSearchTime = gpGlobals->curtime + randomInterval;
+				m_hLastArrivedProp = m_hHighCoverProp;  // Mark this prop as last arrived
+				Msg("[DEBUG] HIGH_COVER: NEW prop arrived! Timer reset to %.1fs\n", randomInterval);
+			}
+			else
+			{
+				// Same prop - don't reset timer, let it continue counting down
+				Msg("[DEBUG] HIGH_COVER: Same prop - timer continues (%.1fs remaining)\n",
+					m_flNextPropSearchTime - gpGlobals->curtime);
+			}
+
 			TaskComplete();
 			return;
 		}
-		// Set navigation (GatherConditions already validated navigability)
+
+		// Set navigation goal (GatherConditions already validated navigability)
 		AI_NavGoal_t goal(targetPosition, ACT_RUN, AIN_DEF_TOLERANCE);
 		if (GetNavigator()->SetGoal(goal))
 		{
@@ -1224,6 +1518,7 @@ void CNPC_Combine::StartTask(const Task_t* pTask)
 
 
 
+
 	case TASK_COMBINE_MOVE_TO_LOW_COVER: // [MODIFICATION-Dynamic Cover]
 	{
 		if (!m_hLowCoverProp || !GetEnemy())
@@ -1232,24 +1527,40 @@ void CNPC_Combine::StartTask(const Task_t* pTask)
 			return;
 		}
 
-		// Calculate cover position
+		// Calculate cover position behind the prop
 		Vector enemyToProp = m_hLowCoverProp->GetAbsOrigin() - GetEnemy()->GetAbsOrigin();
 		VectorNormalize(enemyToProp);
 		enemyToProp.z = 0;
 		Vector targetPosition = m_hLowCoverProp->GetAbsOrigin() + (enemyToProp * 80.0f);
-
 		float distToTarget = GetAbsOrigin().DistTo(targetPosition);
+
 		Msg("[DEBUG] LOW_COVER: dist=%.1f\n", distToTarget);
 
-		// Check if already arrived
+		// Check if already arrived at target position
 		if (distToTarget <= 50.0f)
 		{
 			ClearCondition(COND_COMBINE_HAS_LOW_COVER);
+
+			// Only reset timer if this is a new prop (different from last arrived)
+			if (m_hLastArrivedProp != m_hLowCoverProp)
+			{
+				float randomInterval = RandomFloat(8.0f, 12.0f);
+				m_flNextPropSearchTime = gpGlobals->curtime + randomInterval;
+				m_hLastArrivedProp = m_hLowCoverProp;  // Mark this prop as last arrived
+				Msg("[DEBUG] LOW_COVER: NEW prop arrived! Timer reset to %.1fs\n", randomInterval);
+			}
+			else
+			{
+				// Same prop - don't reset timer, let it continue counting down
+				Msg("[DEBUG] LOW_COVER: Same prop - timer continues (%.1fs remaining)\n",
+					m_flNextPropSearchTime - gpGlobals->curtime);
+			}
+
 			TaskComplete();
 			return;
 		}
 
-		// Set navigation (GatherConditions already validated navigability)
+		// Set navigation goal (GatherConditions already validated navigability)
 		AI_NavGoal_t goal(targetPosition, ACT_RUN, AIN_DEF_TOLERANCE);
 		if (GetNavigator()->SetGoal(goal))
 		{
@@ -1260,7 +1571,8 @@ void CNPC_Combine::StartTask(const Task_t* pTask)
 			TaskFail("Could not set navigation goal");
 		}
 	}
-	break;  
+	break;
+
 
 
 
@@ -1620,6 +1932,130 @@ void CNPC_Combine::RunTask(const Task_t* pTask)
 
 	switch (pTask->iTask)
 	{
+	case TASK_COMBINE_PULL_GRENADE:
+	{
+		// --- Guard Clauses & Pre-computation ---
+
+		// First, ensure the object we're pulling is still valid (e.g., hasn't exploded). If not, abort the schedule.
+		if (!m_hPulledObject.Get())
+		{
+			DevMsg("RunTask: Pulled object has disappeared! Failing task.\n");
+			TaskFail(FAIL_NO_ENEMY);
+			return;
+		}
+
+		// Ensure the object still has a physics representation.
+		IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
+		if (!pPhysObject)
+		{
+			DevMsg("RunTask: Target does not have a valid physics object! Failing task.\n");
+			TaskFail(FAIL_NO_ENEMY);
+			return;
+		}
+
+		// Get the current position of the left hand attachment point, which is our pull target.
+		Vector vecHandPos;
+		QAngle angHand;
+		if (!GetAttachment("lefthand", vecHandPos, angHand))
+		{
+			DevMsg("RunTask: Fatal Error! 'lefthand' attachment not found on model.\n");
+			TaskFail(FAIL_NO_ENEMY);
+			return;
+		}
+
+		// Calculate the straight-line distance from the hand to the grenade.
+		Vector vecObjectPos = m_hPulledObject->WorldSpaceCenter();
+		float flDist = vecHandPos.DistTo(vecObjectPos);
+		DevMsg("RunTask: Pulling object. Distance: %.2f\n", flDist);
+
+		// --- Catch Logic ---
+		// If the grenade is close enough, "catch" it.
+		const float flCatchDistance = 24.0f;
+		if (flDist <= flCatchDistance)
+		{
+			DevMsg("RunTask: Objeto PEGO! Resetando timer e anexando à mão.\n");
+
+			// Reset the grenade's fuse to give us time to throw it back.
+			CBaseGrenade* pBaseGrenade = static_cast<CBaseGrenade*>(m_hPulledObject.Get());
+			if (pBaseGrenade)
+			{
+				float flNewDetTime = 2.5f;
+				pBaseGrenade->m_flDetonateTime = gpGlobals->curtime + flNewDetTime;
+				pBaseGrenade->StopSound("Grenade.Tick");
+				DevMsg("RunTask: Timer da granada resetado!\n");
+			}
+			else
+			{
+				DevMsg("RunTask: Falha ao converter para CBaseGrenade.\n");
+			}
+
+			// Disable the grenade's physics simulation and attach it to the Combine's hand.
+			pPhysObject->EnableMotion(false);
+			int iHandAttachment = LookupAttachment("lefthand");
+			m_hPulledObject->SetParent(this, iHandAttachment);
+
+			TaskComplete();
+			return;
+		}
+
+		// --- Pulling Physics Logic (with Braking Zone) ---
+		// If not caught yet, apply a pull force.
+		float flPullForce;
+		const float flBrakingZone = 80.0f;
+		if (flDist < flBrakingZone)
+		{
+			// If inside the braking zone, use a weaker force for a smooth catch.
+			flPullForce = 500.0f;
+		}
+		else
+		{
+			// If outside the zone, use full force to pull it in quickly.
+			flPullForce = 1500.0f;
+		}
+
+		Vector vecPullDir = vecHandPos - vecObjectPos;
+		VectorNormalize(vecPullDir);
+		vecPullDir *= flPullForce;
+		pPhysObject->ApplyForceCenter(vecPullDir);
+		break;
+	}
+
+	// [MODIFICATION] This task is instantaneous. All logic is handled in StartTask.
+	case TASK_COMBINE_LAUNCH_GRENADE:
+	{
+		// This block is empty because the action is completed in a single frame in StartTask.
+		break;
+	}
+
+	// [MODIFICATION] This task actively turns the Combine to face the grenade.
+	case TASK_COMBINE_FACE_GRENADE:
+	{
+		// Every frame, re-acquire the grenade's position and update the motor's target yaw.
+		// This creates an "active" turn that prevents the AI from idling and restarting the schedule.
+		CSound* pSound = GetBestSound();
+		if (pSound && pSound->m_hOwner)
+		{
+			GetMotor()->SetIdealYawToTargetAndUpdate(pSound->m_hOwner->GetAbsOrigin());
+		}
+		else
+		{
+			// If the sound is lost, turn off the turbo and fail the task.
+			m_bForceFastTurn = false;
+			TaskFail(FAIL_NO_ENEMY);
+			return;
+		}
+
+		// The task completes only when the Combine is facing the ideal direction.
+		if (FacingIdeal())
+		{
+			// On completion, we MUST disable the "turbo turn" flag to return to normal speed.
+			m_bForceFastTurn = false;
+			DevMsg("RunTask: Terminou de VIRAR para a granada (TURBO DESLIGADO).\n");
+			TaskComplete();
+		}
+		break;
+	}
+
 
 	case TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY:
 		RunTaskChaseEnemyContinuously(pTask);
@@ -2208,12 +2644,12 @@ int CNPC_Combine::SelectCombatSchedule()
 			{
 				// I'm the leader, but I didn't get the job suppressing the enemy. We know this because
 				// This code only runs if the code above didn't assign me SCHED_COMBINE_SUPPRESS.
-				if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+				if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 				{
 					return SCHED_RANGE_ATTACK1;
 				}
 
-				if (HasCondition(COND_WEAPON_HAS_LOS) && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+				if (HasCondition(COND_WEAPON_HAS_LOS) && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 				{
 					// If everyone else is attacking and I have line of fire, wait for a chance to cover someone.
 					if (OccupyStrategySlot(SQUAD_SLOT_OVERWATCH))
@@ -2238,7 +2674,7 @@ int CNPC_Combine::SelectCombatSchedule()
 					}
 				}
 
-				if (!bFirstContact && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+				if (!bFirstContact && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 				{
 					if (random->RandomInt(0, 100) < 60)
 					{
@@ -2332,7 +2768,7 @@ int CNPC_Combine::SelectCombatSchedule()
 		Stand();
 		DesireStand();
 
-		if (GetEnemy() && !(GetEnemy()->GetFlags() & FL_NOTARGET) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (GetEnemy() && !(GetEnemy()->GetFlags() & FL_NOTARGET) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 		{
 			// Charge in and break the enemy's cover!
 			return SCHED_ESTABLISH_LINE_OF_FIRE;
@@ -2354,7 +2790,7 @@ int CNPC_Combine::SelectCombatSchedule()
 	// --------------------------------------------------------------
 	if (HasCondition(COND_SEE_ENEMY) && !HasCondition(COND_CAN_RANGE_ATTACK1))
 	{
-		if ((HasCondition(COND_TOO_FAR_TO_ATTACK) || IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY)) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if ((HasCondition(COND_TOO_FAR_TO_ATTACK) || IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY)) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 		{
 			return SCHED_COMBINE_PRESS_ATTACK;
 		}
@@ -2501,7 +2937,11 @@ int CNPC_Combine::SelectSchedule(void)
 #else
 						m_Sentences.Speak(pSentenceName, SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL);
 #endif
-
+						// --- CUSTOM: grenade return/kick logic ---
+						if (HasCondition(COND_CAN_KICK_GRENADE) && HasCondition(COND_CAN_RETURN_GRENADE))
+						{
+							return (random->RandomInt(1, 2) == 1) ? SCHED_COMBINE_KICK_GRENADE : SCHED_COMBINE_RETURN_GRENADE;
+						}
 						// If the sound is approaching danger, I have no enemy, and I don't see it, turn to face.
 						if (!GetEnemy() && pSound->IsSoundType(SOUND_CONTEXT_DANGER_APPROACH) && pSound->m_hOwner && !FInViewCone(pSound->GetSoundReactOrigin()))
 						{
@@ -2573,7 +3013,7 @@ int CNPC_Combine::SelectSchedule(void)
 	case NPC_STATE_COMBAT:
 	{
 
-		if (HasCondition(COND_SEE_ENEMY) && HasCondition(COND_CAN_RANGE_ATTACK1)) // [MODIFICATION-Dynamic Cover] - Start
+		if (HasCondition(COND_SEE_ENEMY) && HasCondition(COND_CAN_RANGE_ATTACK1)) // [MODIFICATION] - DYNAMIC COVER - START
 		{
 			bool hasLow = HasCondition(COND_COMBINE_HAS_LOW_COVER);
 			bool hasHigh = HasCondition(COND_COMBINE_HAS_HIGH_COVER);
@@ -2636,7 +3076,7 @@ int CNPC_Combine::SelectSchedule(void)
 
 			// If reached here, no valid covers available
 			Msg("[DEBUG] SelectSchedule: No valid cover available - using default AI\n");
-		} // [MODIFICATION-Dynamic Cover] - End
+		} // [MODIFICATION] - DYNAMIC COVER - END
 		// Seguir com código original da Valve
 		int nSched = SelectCombatSchedule();
 		if (nSched != SCHED_NONE)
@@ -2656,10 +3096,10 @@ int CNPC_Combine::SelectFailSchedule(int failedSchedule, int failedTask, AI_Task
 	if (failedSchedule == SCHED_COMBINE_TAKE_COVER1)
 	{
 #ifdef MAPBASE
-		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2) && HasCondition(COND_SEE_ENEMY)
+		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10) && HasCondition(COND_SEE_ENEMY)
 			&& (!npc_combine_new_cover_behavior.GetBool() || (taskFailCode == FAIL_NO_COVER)))
 #else
-		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2) && HasCondition(COND_SEE_ENEMY))
+		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10) && HasCondition(COND_SEE_ENEMY))
 #endif
 		{
 			// This eases the effects of an unfortunate bug that usually plagues shotgunners. Since their rate of fire is low,
@@ -2744,12 +3184,12 @@ int CNPC_Combine::SelectScheduleAttack()
 		{
 			if (HasCondition(COND_SEE_ENEMY))
 			{
-				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 					return SCHED_RANGE_ATTACK1;
 			}
 			else
 			{
-				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 					return SCHED_COMBINE_PRESS_ATTACK;
 			}
 		}
@@ -2780,7 +3220,7 @@ int CNPC_Combine::SelectScheduleAttack()
 #endif
 
 		// Engage if allowed
-		if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 		{
 			return SCHED_RANGE_ATTACK1;
 		}
@@ -2886,7 +3326,7 @@ int CNPC_Combine::TranslateSchedule(int scheduleType)
 	break;
 	case SCHED_COMBINE_TAKECOVER_FAILED:
 	{
-		if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 		{
 			return TranslateSchedule(SCHED_RANGE_ATTACK1);
 		}
@@ -2965,7 +3405,7 @@ int CNPC_Combine::TranslateSchedule(int scheduleType)
 
 		if (IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY) && !IsRunningBehavior())
 		{
-			if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+			if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 			{
 				return SCHED_COMBINE_PRESS_ATTACK;
 			}
@@ -3227,7 +3667,16 @@ void CNPC_Combine::HandleAnimEvent(animevent_t* pEvent)
 			break;
 
 		case COMBINE_AE_GREN_TOSS:
-		{
+		{	
+			// Verificação para a habilidade "Devolver ao Remetente"
+			if (m_bIsReturningGrenade)
+			{
+				DevMsg("HandleAnimEvent: GREN_TOSS bloqueado! O soldado está no modo 'Devolver'.\n");
+				// Retornamos imediatamente para não criar a granada duplicada.
+				// O handledEvent não é setado, o que é correto neste caso.
+				return;
+			}
+
 			Vector vecSpin;
 			vecSpin.x = random->RandomFloat(-1000.0, 1000.0);
 			vecSpin.y = random->RandomFloat(-1000.0, 1000.0);
@@ -4223,10 +4672,10 @@ bool CNPC_Combine::OnBeginMoveAndShoot()
 {
 	if (BaseClass::OnBeginMoveAndShoot())
 	{
-		if (HasStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (HasStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 			return true; // already have the slot I need
 
-		if (!HasStrategySlotRange(SQUAD_SLOT_GRENADE1, SQUAD_SLOT_ATTACK_OCCLUDER) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
+		if (!HasStrategySlotRange(SQUAD_SLOT_GRENADE1, SQUAD_SLOT_ATTACK_OCCLUDER) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK10))
 			return true;
 	}
 	return false;
@@ -4241,31 +4690,31 @@ void CNPC_Combine::OnEndMoveAndShoot()
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency( CBaseCombatWeapon *pWeapon )
+WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeapon)
 {
 #ifdef MAPBASE
-	if( pWeapon->ClassMatches( gm_isz_class_AR2 ) )
+	if (pWeapon->ClassMatches(gm_isz_class_AR2))
 #else
-	if( FClassnameIs( pWeapon, "weapon_ar2" ) )
+	if (FClassnameIs(pWeapon, "weapon_ar2"))
 #endif
 	{
-		if( hl2_episodic.GetBool() )
+		if (hl2_episodic.GetBool())
 		{
 			return WEAPON_PROFICIENCY_VERY_GOOD;
 		}
 		else
 		{
-			return WEAPON_PROFICIENCY_GOOD;
+			return WEAPON_PROFICIENCY_VERY_GOOD;
 		}
 	}
 #ifdef MAPBASE
-	else if( pWeapon->ClassMatches( gm_isz_class_Shotgun ) )
+	else if (pWeapon->ClassMatches(gm_isz_class_Shotgun))
 #else
-	else if( FClassnameIs( pWeapon, "weapon_shotgun" )	)
+	else if (FClassnameIs(pWeapon, "weapon_shotgun"))
 #endif
 	{
 #ifndef MAPBASE // Moved so soldiers don't change skin unnaturally and uncontrollably
-		if( m_nSkin != COMBINE_SKIN_SHOTGUNNER )
+		if (m_nSkin != COMBINE_SKIN_SHOTGUNNER)
 		{
 			m_nSkin = COMBINE_SKIN_SHOTGUNNER;
 		}
@@ -4274,24 +4723,23 @@ WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency( CBaseCombatWeapon *pWea
 		return WEAPON_PROFICIENCY_PERFECT;
 	}
 #ifdef MAPBASE
-	else if( pWeapon->ClassMatches( gm_isz_class_SMG1 ) )
+	else if (pWeapon->ClassMatches(gm_isz_class_SMG1))
 #else
-	else if( FClassnameIs( pWeapon, "weapon_smg1" ) )
+	else if (FClassnameIs(pWeapon, "weapon_smg1"))
 #endif
 	{
-		return WEAPON_PROFICIENCY_GOOD;
+		return WEAPON_PROFICIENCY_VERY_GOOD;
 	}
 #ifdef MAPBASE
-	else if ( pWeapon->ClassMatches( gm_isz_class_Pistol ) )
+	else if (pWeapon->ClassMatches(gm_isz_class_Pistol))
 	{
 		// Mods which need a lower soldier pistol accuracy can either change this value or use proficiency override in Hammer.
 		return WEAPON_PROFICIENCY_VERY_GOOD;
 	}
 #endif
 
-	return BaseClass::CalcWeaponProficiency( pWeapon );
+	return BaseClass::CalcWeaponProficiency(pWeapon);
 }
-
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
@@ -4430,8 +4878,13 @@ DECLARE_TASK(TASK_COMBINE_DIE_INSTANTLY)
 DECLARE_TASK(TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET)
 DECLARE_TASK(TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS)
 DECLARE_TASK(TASK_COMBINE_SET_STANDING)
-DECLARE_TASK(TASK_COMBINE_MOVE_TO_LOW_COVER) // [MODIFICATION-Dynamic Cover]
-DECLARE_TASK(TASK_COMBINE_MOVE_TO_HIGH_COVER) // [MODIFICATION-Dynamic Cover]
+DECLARE_TASK(TASK_COMBINE_MOVE_TO_LOW_COVER) // [MODIFICATION-Dynamic Cover
+DECLARE_TASK(TASK_COMBINE_MOVE_TO_HIGH_COVER) // [MODIFICATION-Dynamic Cover
+DECLARE_TASK(TASK_COMBINE_PULL_GRENADE)		// [MODIFICATION] For the "Catch and Return" ability: physically pulls the grenade towards the NPC.
+DECLARE_TASK(TASK_COMBINE_LAUNCH_GRENADE)		// [MODIFICATION] For the "Catch and Return" ability: launches the caught grenade back.
+DECLARE_TASK(TASK_COMBINE_FACE_GRENADE)		// [MODIFICATION] For both abilities: makes the Combine perform a high-speed turn to face the grenade.
+DECLARE_TASK(TASK_COMBINE_MEMORIZE_GRENADE)	// [MODIFICATION] For the "Kick" ability: "memorizes" the grenade as a target.
+DECLARE_TASK(TASK_COMBINE_KICK_LAUNCH)		// [MODIFICATION] For the "Kick" ability: applies the kick physics to the memorized grenade.
 
 //Activities
 #if !SHARED_COMBINE_ACTIVITIES
@@ -4463,8 +4916,10 @@ DECLARE_CONDITION(COND_COMBINE_HIT_BY_BUGBAIT)
 DECLARE_CONDITION(COND_COMBINE_DROP_GRENADE)
 DECLARE_CONDITION(COND_COMBINE_ON_FIRE)
 DECLARE_CONDITION(COND_COMBINE_ATTACK_SLOT_AVAILABLE)
-DECLARE_CONDITION(COND_COMBINE_HAS_HIGH_COVER) // [MODIFICATION-Dynamic Cover]
-DECLARE_CONDITION(COND_COMBINE_HAS_LOW_COVER) // [MODIFICATION-Dynamic Cover]
+DECLARE_CONDITION(COND_COMBINE_HAS_HIGH_COVER) // [MODIFICATION-Dynamic Cover
+DECLARE_CONDITION(COND_COMBINE_HAS_LOW_COVER) // [MODIFICATION-Dynamic Cover
+DECLARE_CONDITION(COND_CAN_KICK_GRENADE)
+DECLARE_CONDITION(COND_CAN_RETURN_GRENADE)
 
 DECLARE_INTERACTION(g_interactionCombineBash);
 
@@ -5189,11 +5644,11 @@ DEFINE_SCHEDULE
 
 
 //=========================================================
-// SCHED_COMBINE_MOVE_TO_HIGH_COVER
+// SCHED_COMBINE_MOVE_TO_HIGH_COVER - // [MODIFICATION-Dynamic Cover
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_MOVE_TO_HIGH_COVER, // [MODIFICATION-Dynamic Cover]
+	SCHED_COMBINE_MOVE_TO_HIGH_COVER,
 
 	"	Tasks"
 	"		TASK_STOP_MOVING						0"
@@ -5208,23 +5663,71 @@ DEFINE_SCHEDULE
 )
 
 //=========================================================
-// SCHED_COMBINE_MOVE_TO_LOW_COVER
+// SCHED_COMBINE_MOVE_TO_LOW_COVER - // [MODIFICATION-Dynamimic Cover
 //=========================================================
 
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_MOVE_TO_LOW_COVER, // [MODIFICATION-Dynamic Cover]
+	SCHED_COMBINE_MOVE_TO_LOW_COVER,
 
 	"   Tasks"
 	"		TASK_STOP_MOVING					    0"
 	"		TASK_COMBINE_MOVE_TO_LOW_COVER			0"
-	"		TASK_RUN_PATH_TIMED						8"
+	"		TASK_RUN_PATH_TIMED						4"
 	"		TASK_WAIT_FOR_MOVEMENT					0"
 	"		TASK_FACE_ENEMY							0"
 	"		TASK_RANGE_ATTACK1						0"
 	""
 	"   Interrupts"
 
+)
+
+//=========================================================
+// SCHED_COMBINE_RETURN_GRENADE
+// [MODIFICATION] Custom schedule for the "Catch and Return" ability.
+// Defines the sequence for pulling, re-priming, aiming, and throwing back an enemy grenade.
+//=========================================================
+DEFINE_SCHEDULE
+(
+	SCHED_COMBINE_RETURN_GRENADE,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"		// 1. Stop moving to focus on the action.
+	"		TASK_COMBINE_FACE_GRENADE		0"		// 2. Perform a fast turn to face the grenade.
+	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_COVER_LOW"	// 3. Start the crouch animation (non-blocking).
+	"		TASK_COMBINE_PULL_GRENADE		0"		// 4. Pull the grenade in; this task also resets its fuse timer.
+	"		TASK_FACE_ENEMY					0"		// 5. Turn to face the enemy to aim the counter-throw.
+	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_RANGE_ATTACK2"	// 6. Start the throw animation (which includes standing up).
+	"		TASK_WAIT						0.7"	// 7. A controlled pause for the throw animation's wind-up.
+	"		TASK_COMBINE_LAUNCH_GRENADE		0"		// 8. Launch the original grenade back at the enemy.
+	""
+
+	"	Interrupts"
+	"		COND_HEAVY_DAMAGE"						// Abort if heavy damage is taken.
+	"		COND_NO_SOUND"							// Abort if the grenade sound disappears.
+)
+
+//=========================================================
+// SCHED_COMBINE_KICK_GRENADE
+// [MODIFICATION] Custom schedule for the alternative "Kick Grenade" ability.
+// Defines a fast, reactive sequence to kick a nearby grenade away.
+//=========================================================
+DEFINE_SCHEDULE
+(
+	SCHED_COMBINE_KICK_GRENADE,
+
+	"	Tasks"
+	"		TASK_COMBINE_MEMORIZE_GRENADE	0"		// 1. Instantly "memorize" the grenade as the target for the kick.
+	"		TASK_STOP_MOVING				0"		// 2. Stop moving.
+	"		TASK_COMBINE_FACE_GRENADE		0"		// 3. Perform a fast turn to face the grenade.
+	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_MELEE_ATTACK2"	// 4. Start the kick animation (non-blocking).
+	"		TASK_WAIT						0.3"	// 5. A minimal pause to sync the animation with the physics.
+	"		TASK_COMBINE_KICK_LAUNCH		0"		// 6. Apply the kick physics to the memorized grenade.
+	""
+
+	"	Interrupts"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_SOUND"
 )
 
 
